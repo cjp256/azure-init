@@ -7,7 +7,7 @@ use reqwest::{Client, StatusCode};
 
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json;
 use serde_json::Value;
 
@@ -38,14 +38,14 @@ use crate::http;
 /// let metadata: imds::InstanceMetadata =
 ///     serde_json::from_str(&TESTDATA.to_string()).unwrap();
 /// ```
-#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Serialize, Clone)]
 pub struct InstanceMetadata {
     /// Compute metadata
     pub compute: Compute,
 }
 
 /// Metadata about the instance's virtual machine. Written in JSON format.
-#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Serialize, Clone)]
 pub struct Compute {
     /// Metadata about the operating system.
     #[serde(rename = "osProfile")]
@@ -73,7 +73,7 @@ pub struct Compute {
 /// });
 /// let os_profile: OsProfile = serde_json::from_value(TESTDATA).unwrap();
 /// ```
-#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Serialize, Clone)]
 pub struct OsProfile {
     /// The admin account's username.
     #[serde(rename = "adminUsername")]
@@ -103,7 +103,7 @@ pub struct OsProfile {
 /// });
 /// let ssh_key: PublicKeys = serde_json::from_value(TESTDATA).unwrap();
 /// ```
-#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Serialize, Clone)]
 pub struct PublicKeys {
     /// The SSH public key certificate used to authenticate with the virtual machine.
     #[serde(rename = "keyData")]
@@ -215,8 +215,11 @@ pub async fn query(
     .await?;
 
     let imds_body = response?.text().await?;
+    tracing::info!("IMDS response:\n{}\n", &imds_body);
 
     let metadata: InstanceMetadata = serde_json::from_str(&imds_body)?;
+    let pretty_metadata = serde_json::to_string_pretty(&metadata)?;
+    tracing::info!("Parsed response:\n{}\n", pretty_metadata);
 
     Ok(metadata)
 }
