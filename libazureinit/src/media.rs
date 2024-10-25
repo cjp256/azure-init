@@ -10,7 +10,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_xml_rs::from_str;
 
 use tracing;
@@ -19,7 +19,7 @@ use tracing::instrument;
 use crate::error::Error;
 use fstab::FsTab;
 
-#[derive(Debug, Default, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize, Clone)]
 pub struct Environment {
     #[serde(rename = "ProvisioningSection")]
     pub provisioning_section: ProvisioningSection,
@@ -27,7 +27,7 @@ pub struct Environment {
     pub platform_settings_section: PlatformSettingsSection,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize, Clone)]
 pub struct ProvisioningSection {
     #[serde(rename = "Version")]
     pub version: String,
@@ -35,7 +35,7 @@ pub struct ProvisioningSection {
     pub linux_prov_conf_set: LinuxProvisioningConfigurationSet,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize, Clone)]
 pub struct LinuxProvisioningConfigurationSet {
     #[serde(rename = "UserName")]
     pub username: String,
@@ -45,7 +45,7 @@ pub struct LinuxProvisioningConfigurationSet {
     pub hostname: String,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize, Clone)]
 pub struct PlatformSettingsSection {
     #[serde(rename = "Version")]
     pub version: String,
@@ -53,7 +53,7 @@ pub struct PlatformSettingsSection {
     pub platform_settings: PlatformSettings,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize, Clone)]
 pub struct PlatformSettings {
     #[serde(default = "default_preprov", rename = "PreprovisionedVm")]
     pub preprovisioned_vm: bool,
@@ -218,7 +218,10 @@ pub fn mount_parse_ovf_env(dev: String) -> Result<Environment, Error> {
     })?;
 
     let ovf_body = mounted.read_ovf_env_to_string()?;
-    let environment = parse_ovf_env(ovf_body.as_str())?;
+    tracing::info!("Raw OVF:\n{}\n", ovf_body);
+    let environment: Environment = parse_ovf_env(ovf_body.as_str())?;
+    let pretty_environment = serde_json::to_string_pretty(&environment)?;
+    tracing::info!("Parsed OVF environment:\n{}\n", pretty_environment);
 
     mounted.unmount().map_err(|e| {
         tracing::error!(error = ?e, "Failed to remove media.");

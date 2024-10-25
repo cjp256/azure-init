@@ -15,7 +15,7 @@ use libazureinit::{
     reqwest::{header, Client},
     HostnameProvisioner, PasswordProvisioner, Provision, UserProvisioner,
 };
-use tracing::instrument;
+use tracing::{info, instrument};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
@@ -50,6 +50,7 @@ fn get_environment() -> Result<Environment, anyhow::Error> {
 
     // loop until it finds a correct device.
     for dev in ovf_devices {
+        info!("Trying to mount/parse OVF environment for device: {:?}", dev);
         environment = match media::mount_parse_ovf_env(dev) {
             Ok(env) => Some(env),
             Err(_) => continue,
