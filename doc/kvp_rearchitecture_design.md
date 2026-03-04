@@ -255,17 +255,64 @@ impl<S: KvpStore + Clone> Kvp<S> {
 | Background writer | Tokio task + channel + `CancellationToken` | Removed — synchronous flock + write + unlock |
 | close() / shutdown | Required to drain async channel | Not needed — writes are synchronous |
 
-## Proposed Module Structure
+## Proposed Crate & Module Structure
 
-The `kvp` module becomes a directory with sub-modules:
+KVP is extracted into its own crate, `libazureinit-kvp`, as a workspace member alongside `libazureinit` and `azure-init`. This gives the KVP subsystem an independent dependency tree, its own test target, and a clean public API boundary.
+
+### Workspace layout
 
 ```
-libazureinit/src/kvp/
-├── mod.rs            // re-exports, KvpStore trait, KvpOptions
-├── hyperv.rs         // HyperVKvpStore, encode/decode, truncate
-├── memory.rs         // InMemoryKvpStore
-├── diagnostics.rs    // DiagnosticsKvp<S>
-├── tracing.rs        // TracingKvpLayer<S>, StringVisitor, MyInstant
-├── provisioning.rs   // ProvisioningReport struct
-└── tests.rs          // shared test helpers, all #[cfg(test)] tests
+azure-init/                       # workspace root
+├── Cargo.toml                    # [workspace] members
+├── src/main.rs                   # azure-init binary
+├── libazureinit/
+│   ├── Cargo.toml                # depends on libazureinit-kvp
+│   └── src/
+│       ├── lib.rs
+│       ├── logging.rs            # wires TracingKvpLayer into subscriber
+│       └── ...
+└── libazureinit-kvp/
+    ├── Cargo.toml                # [package] name = "libazureinit-kvp"
+    └── src/
+        ├── lib.rs                // re-exports, KvpStore trait, KvpOptions
+        ├── hyperv.rs             // HyperVKvpStore, encode/decode, truncate
+        ├── memory.rs             // InMemoryKvpStore
+        ├── diagnostics.rs        // DiagnosticEvent, DiagnosticsKvp<S>
+        ├── tracing.rs            // TracingKvpLayer<S>, StringVisitor, MyInstant
+        ├── provisioning.rs       // ProvisioningReport struct
+        └── tests.rs              // shared test helpers, all #[cfg(test)] tests
 ```
+
+### Dependency graph
+
+```
+azure-init  ──►  libazureinit  ──►  libazureinit-kvp
+```
+
+`libazureinit` depends on `libazureinit-kvp` via a workspace path dependency. `azure-init` (the binary crate) continues to depend only on `libazureinit`.
+
+### libazureinit-kvp Cargo.toml (key sections)
+
+```toml
+[package]
+name = "libazureinit-kvp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+```
+
+### What changes in libazureinit
+
+- The existing `mod kvp` (private) and its `pub use` re-exports in `logging.rs` are replaced by `use libazureinit_kvp::{…}`.
+- `libazureinit/Cargo.toml` adds `libazureinit-kvp = { path = "../libazureinit-kvp" }` to `[dependencies]`.
+- No other modules in `libazureinit` are affected.
