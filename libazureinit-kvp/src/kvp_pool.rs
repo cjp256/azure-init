@@ -260,6 +260,25 @@ impl KvpPoolStore {
             .truncate(false)
             .open(&self.path)
     }
+
+    /// Create a read-only iterator over all records.
+    ///
+    /// Acquires a shared lock that is released when the iterator is
+    /// dropped.
+    pub fn iter(&self) -> Result<KvpPoolIter, KvpError> {
+        let file = self.open_for_read()?;
+        KvpPoolIter::new(file, false)
+    }
+
+    /// Create a read-write iterator over all records.
+    ///
+    /// Acquires an exclusive lock that is released when the iterator is
+    /// dropped. Supports [`KvpPoolIter::overwrite_current_value`],
+    /// [`KvpPoolIter::append`], and [`KvpPoolIter::remove_current`].
+    pub fn iter_mut(&self) -> Result<KvpPoolIter, KvpError> {
+        let file = self.open_for_read_write_create()?;
+        KvpPoolIter::new(file, true)
+    }
 }
 
 pub(crate) fn encode_record(key: &str, value: &str) -> Vec<u8> {
@@ -299,42 +318,184 @@ pub(crate) fn decode_record(data: &[u8]) -> io::Result<(String, String)> {
     Ok((key, value))
 }
 
-fn read_all_records(file: &mut File) -> io::Result<Vec<(String, String)>> {
-    let len = file.metadata()?.len() as usize;
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-
-    if !len.is_multiple_of(RECORD_SIZE) {
-        return Err(io::Error::other(format!(
-            "file size ({len}) is not a multiple of record size ({RECORD_SIZE})"
-        )));
-    }
-
-    file.seek(io::SeekFrom::Start(0))?;
-    let record_count = len / RECORD_SIZE;
-    let mut records = Vec::with_capacity(record_count);
-    let mut buf = [0u8; RECORD_SIZE];
-
-    for _ in 0..record_count {
-        file.read_exact(&mut buf)?;
-        records.push(decode_record(&buf)?);
-    }
-
-    Ok(records)
+/// A record-at-a-time iterator over a KVP pool file.
+///
+/// Uses file I/O with seek semantics for memory-efficient iteration
+/// without loading all records into memory.  Supports in-place value
+/// overwrites and record removal for the last-yielded record.
+///
+/// The underlying file is locked for the lifetime of the iterator;
+/// the lock is released on drop.
+pub struct KvpPoolIter {
+    file: File,
+    record_count: usize,
+    current_index: usize,
 }
 
-fn rewrite_file(
-    file: &mut File,
-    map: &HashMap<String, String>,
-) -> Result<(), KvpError> {
-    file.set_len(0)?;
-    file.seek(io::SeekFrom::Start(0))?;
-    for (k, v) in map {
-        file.write_all(&encode_record(k, v))?;
+impl KvpPoolIter {
+    fn new(
+        mut file: File,
+        lock_exclusive: bool,
+    ) -> Result<Self, KvpError> {
+        let lock_result = if lock_exclusive {
+            fcntl_lock_exclusive(&file)
+        } else {
+            fcntl_lock_shared(&file)
+        };
+        lock_result.map_err(|e| {
+            io::Error::other(format!("failed to lock KVP file: {e}"))
+        })?;
+
+        let len = file.metadata()?.len() as usize;
+        if len > 0 && !len.is_multiple_of(RECORD_SIZE) {
+            let _ = fcntl_unlock(&file);
+            return Err(io::Error::other(format!(
+                "file size ({len}) is not a multiple of record size \
+                 ({RECORD_SIZE})"
+            ))
+            .into());
+        }
+
+        let record_count = len / RECORD_SIZE;
+        file.seek(io::SeekFrom::Start(0))?;
+        Ok(Self {
+            file,
+            record_count,
+            current_index: 0,
+        })
     }
-    file.flush()?;
-    Ok(())
+
+    /// The number of records in the file (updated by
+    /// [`append`](Self::append) and
+    /// [`remove_current`](Self::remove_current)).
+    pub fn record_count(&self) -> usize {
+        self.record_count
+    }
+
+    /// Overwrite the value field of the record last returned by
+    /// [`next()`](Iterator::next), zero-padding to fill the fixed-width
+    /// 2048-byte field.
+    ///
+    /// After the write the file position is at the start of the next
+    /// record, so iteration can continue normally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before the first `next()` call.
+    pub fn overwrite_current_value(
+        &mut self,
+        value: &str,
+    ) -> io::Result<()> {
+        assert!(self.current_index > 0, "no record has been read yet");
+
+        let record_start =
+            (self.current_index - 1) as u64 * RECORD_SIZE as u64;
+        let value_offset = record_start + WIRE_MAX_KEY_BYTES as u64;
+        self.file.seek(io::SeekFrom::Start(value_offset))?;
+
+        let mut buf = [0u8; WIRE_MAX_VALUE_BYTES];
+        let bytes = value.as_bytes();
+        let len = bytes.len().min(WIRE_MAX_VALUE_BYTES);
+        buf[..len].copy_from_slice(&bytes[..len]);
+        self.file.write_all(&buf)?;
+
+        // write_all advanced past the value field to the next record
+        // start — no additional seek required.
+        Ok(())
+    }
+
+    /// Append a new record at the end of the file, zero-padded to the
+    /// fixed-width wire format.
+    pub fn append(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> io::Result<()> {
+        self.file.seek(io::SeekFrom::End(0))?;
+        self.file.write_all(&encode_record(key, value))?;
+        self.record_count += 1;
+        Ok(())
+    }
+
+    /// Remove the record last returned by [`next()`](Iterator::next) by
+    /// swapping it with the final record and truncating the file.
+    ///
+    /// After removal the file position rewinds so that the next call to
+    /// `next()` reads the record that was swapped into this slot (unless
+    /// the removed record was already the last one).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before the first `next()` call.
+    pub fn remove_current(&mut self) -> io::Result<()> {
+        assert!(self.current_index > 0, "no record has been read yet");
+
+        let delete_index = self.current_index - 1;
+        let last_index = self.record_count - 1;
+
+        if delete_index != last_index {
+            // Read the last record.
+            self.file.seek(io::SeekFrom::Start(
+                last_index as u64 * RECORD_SIZE as u64,
+            ))?;
+            let mut buf = [0u8; RECORD_SIZE];
+            self.file.read_exact(&mut buf)?;
+
+            // Overwrite the deleted slot.
+            self.file.seek(io::SeekFrom::Start(
+                delete_index as u64 * RECORD_SIZE as u64,
+            ))?;
+            self.file.write_all(&buf)?;
+
+            // Rewind so next() re-reads the swapped record.
+            self.file.seek(io::SeekFrom::Start(
+                delete_index as u64 * RECORD_SIZE as u64,
+            ))?;
+            self.current_index = delete_index;
+        }
+
+        // Truncate to remove the (now-duplicated) last record.
+        self.file
+            .set_len(last_index as u64 * RECORD_SIZE as u64)?;
+        self.record_count -= 1;
+
+        Ok(())
+    }
+
+    /// Flush any buffered writes to the underlying file.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for KvpPoolIter {
+    fn drop(&mut self) {
+        let _ = fcntl_unlock(&self.file);
+    }
+}
+
+impl Iterator for KvpPoolIter {
+    type Item = io::Result<(String, String)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_index >= self.record_count {
+            return None;
+        }
+
+        let mut buf = [0u8; RECORD_SIZE];
+        match self.file.read_exact(&mut buf) {
+            Ok(()) => {
+                self.current_index += 1;
+                Some(decode_record(&buf))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.record_count - self.current_index;
+        (remaining, Some(remaining))
+    }
 }
 
 impl KvpStore for KvpPoolStore {
@@ -350,101 +511,91 @@ impl KvpStore for KvpPoolStore {
         self.validate_key(key)?;
         self.validate_value(value)?;
 
-        let mut file = self.open_for_read_write_create()?;
-        fcntl_lock_exclusive(&file).map_err(|e| {
-            io::Error::other(format!("failed to lock KVP file: {e}"))
-        })?;
+        let mut iter = self.iter_mut()?;
+        let record_count = iter.record_count();
+        let mut found = false;
 
-        let result = (|| -> Result<(), KvpError> {
-            let records = read_all_records(&mut file)?;
-            let mut map: HashMap<String, String> =
-                records.into_iter().collect();
+        while let Some(record) = iter.next() {
+            let (k, _) = record?;
+            if k == key {
+                iter.overwrite_current_value(value)?;
+                found = true;
+                break;
+            }
+        }
 
-            if !map.contains_key(key) && map.len() >= MAX_UNIQUE_KEYS {
+        if !found {
+            if record_count >= MAX_UNIQUE_KEYS {
                 return Err(KvpError::MaxUniqueKeysExceeded {
                     max: MAX_UNIQUE_KEYS,
                 });
             }
+            iter.append(key, value)?;
+        }
 
-            map.insert(key.to_string(), value.to_string());
-            rewrite_file(&mut file, &map)?;
-            Ok(())
-        })();
-
-        let _ = fcntl_unlock(&file);
-        result
+        iter.flush()?;
+        Ok(())
     }
 
     fn read(&self, key: &str) -> Result<Option<String>, KvpError> {
         Self::validate_key_for_read(key)?;
 
-        let mut file = match self.open_for_read() {
-            Ok(f) => f,
-            Err(ref e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let iter = match self.iter() {
+            Ok(it) => it,
+            Err(KvpError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
         };
 
-        fcntl_lock_shared(&file).map_err(|e| {
-            io::Error::other(format!("failed to lock KVP file: {e}"))
-        })?;
-        let records = read_all_records(&mut file);
-        let _ = fcntl_unlock(&file);
-        let records = records?;
+        for record in iter {
+            let (k, v) = record?;
+            if k == key {
+                return Ok(Some(v));
+            }
+        }
 
-        Ok(records.into_iter().find(|(k, _)| k == key).map(|(_, v)| v))
+        Ok(None)
     }
 
     fn entries(&self) -> Result<HashMap<String, String>, KvpError> {
-        let mut file = match self.open_for_read() {
-            Ok(f) => f,
-            Err(ref e) if e.kind() == ErrorKind::NotFound => {
-                return Ok(HashMap::new())
+        let iter = match self.iter() {
+            Ok(it) => it,
+            Err(KvpError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+                return Ok(HashMap::new());
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
 
-        fcntl_lock_shared(&file).map_err(|e| {
-            io::Error::other(format!("failed to lock KVP file: {e}"))
-        })?;
-        let records = read_all_records(&mut file);
-        let _ = fcntl_unlock(&file);
-        let records = records?;
-
-        Ok(records.into_iter().collect())
+        let mut map = HashMap::with_capacity(iter.record_count());
+        for record in iter {
+            let (k, v) = record?;
+            map.insert(k, v);
+        }
+        Ok(map)
     }
 
     fn delete(&self, key: &str) -> Result<bool, KvpError> {
-        let mut file = match self.open_for_read_write() {
+        let file = match self.open_for_read_write() {
             Ok(f) => f,
-            Err(ref e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(ref e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(false);
+            }
             Err(e) => return Err(e.into()),
         };
 
-        fcntl_lock_exclusive(&file).map_err(|e| {
-            io::Error::other(format!("failed to lock KVP file: {e}"))
-        })?;
+        let mut iter = KvpPoolIter::new(file, true)?;
 
-        let result = (|| -> Result<bool, KvpError> {
-            let records = read_all_records(&mut file)?;
-            let original_count = records.len();
-            let kept: Vec<_> =
-                records.into_iter().filter(|(k, _)| k != key).collect();
-
-            if kept.len() == original_count {
-                return Ok(false);
+        while let Some(record) = iter.next() {
+            let (k, _) = record?;
+            if k == key {
+                iter.remove_current()?;
+                iter.flush()?;
+                return Ok(true);
             }
+        }
 
-            file.set_len(0)?;
-            file.seek(io::SeekFrom::Start(0))?;
-            for (k, v) in &kept {
-                file.write_all(&encode_record(k, v))?;
-            }
-            file.flush()?;
-            Ok(true)
-        })();
-
-        let _ = fcntl_unlock(&file);
-        result
+        Ok(false)
     }
 
     fn clear(&self) -> Result<(), KvpError> {

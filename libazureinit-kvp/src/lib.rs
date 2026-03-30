@@ -70,6 +70,7 @@ impl From<io::Error> for KvpError {
 }
 
 pub use kvp_pool::KvpPoolStore;
+pub use kvp_pool::KvpPoolIter;
 
 /// Key-value store with Hyper-V KVP semantics.
 pub trait KvpStore: Send + Sync {
