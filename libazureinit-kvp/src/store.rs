@@ -135,12 +135,10 @@ impl KvpPoolStore {
         validate_key(key, self.mode.max_key_size())?;
         validate_value(value, self.mode.max_value_size())?;
 
-        let iter = self.iter_mut()?;
-        run_with_iter(iter, |iter| {
-            iter.append(key, value)?;
-            iter.flush()?;
-            Ok(())
-        })
+        let mut iter = self.iter_mut()?;
+        iter.append(key, value)?;
+        iter.flush()?;
+        Ok(())
     }
 
     /// Remove all entries from the store.
@@ -176,27 +174,25 @@ impl KvpPoolStore {
             Err(e) => return Err(e.into()),
         };
 
-        let iter = KvpPoolIter::new(file, false)?;
-        run_with_iter(iter, |iter| {
-            let mut found = false;
-            while let Some(record) = iter.next() {
-                let (k, _) = record?;
-                if k == key {
-                    iter.remove_current()?;
-                    found = true;
-                }
+        let mut iter = KvpPoolIter::new(file, false)?;
+        let mut found = false;
+        while let Some(record) = iter.next() {
+            let (k, _) = record?;
+            if k == key {
+                iter.remove_current()?;
+                found = true;
             }
-            if found {
-                iter.flush()?;
-            }
-            Ok(found)
-        })
+        }
+        if found {
+            iter.flush()?;
+        }
+        Ok(found)
     }
 
     /// Return all key-value records in on-disk order, including
     /// duplicates from [`append`](Self::append) calls.
     pub fn dump(&self) -> Result<Vec<(String, String)>, KvpError> {
-        let iter = match self.iter() {
+        let mut iter = match self.iter() {
             Ok(it) => it,
             Err(KvpError::Io(e)) if e.kind() == ErrorKind::NotFound => {
                 return Ok(Vec::new());
@@ -204,18 +200,16 @@ impl KvpPoolStore {
             Err(e) => return Err(e),
         };
 
-        run_with_iter(iter, |iter| {
-            let mut records = Vec::with_capacity(iter.record_count());
-            for record in iter.by_ref() {
-                records.push(record?);
-            }
-            Ok(records)
-        })
+        let mut records = Vec::with_capacity(iter.record_count());
+        for record in iter.by_ref() {
+            records.push(record?);
+        }
+        Ok(records)
     }
 
     /// Return all key-value pairs (deduplicated, last-write-wins).
     pub fn entries(&self) -> Result<HashMap<String, String>, KvpError> {
-        let iter = match self.iter() {
+        let mut iter = match self.iter() {
             Ok(it) => it,
             Err(KvpError::Io(e)) if e.kind() == ErrorKind::NotFound => {
                 return Ok(HashMap::new());
@@ -223,14 +217,12 @@ impl KvpPoolStore {
             Err(e) => return Err(e),
         };
 
-        run_with_iter(iter, |iter| {
-            let mut map = HashMap::with_capacity(iter.record_count());
-            for record in iter.by_ref() {
-                let (k, v) = record?;
-                map.insert(k, v);
-            }
-            Ok(map)
-        })
+        let mut map = HashMap::with_capacity(iter.record_count());
+        for record in iter.by_ref() {
+            let (k, v) = record?;
+            map.insert(k, v);
+        }
+        Ok(map)
     }
 
     /// Insert a new key-value pair or update an existing key's value.
@@ -238,40 +230,38 @@ impl KvpPoolStore {
         validate_key(key, self.mode.max_key_size())?;
         validate_value(value, self.mode.max_value_size())?;
 
-        let iter = self.iter_mut()?;
-        run_with_iter(iter, |iter| {
-            let mut found = false;
-            let mut unique_keys = HashSet::new();
+        let mut iter = self.iter_mut()?;
+        let mut found = false;
+        let mut unique_keys = HashSet::new();
 
-            // Continue past the first match to remove any duplicates
-            // left by prior `append` calls so the upsert collapses to
-            // a single record.
-            while let Some(record) = iter.next() {
-                let (k, _) = record?;
-                let is_target = k == key;
-                unique_keys.insert(k);
-                if is_target {
-                    if !found {
-                        iter.overwrite_current_value(value)?;
-                        found = true;
-                    } else {
-                        iter.remove_current()?;
-                    }
+        // Continue past the first match to remove any duplicates
+        // left by prior `append` calls so the upsert collapses to
+        // a single record.
+        while let Some(record) = iter.next() {
+            let (k, _) = record?;
+            let is_target = k == key;
+            unique_keys.insert(k);
+            if is_target {
+                if !found {
+                    iter.overwrite_current_value(value)?;
+                    found = true;
+                } else {
+                    iter.remove_current()?;
                 }
             }
+        }
 
-            if !found {
-                if unique_keys.len() >= MAX_UNIQUE_KEYS {
-                    return Err(KvpError::MaxUniqueKeysExceeded {
-                        max: MAX_UNIQUE_KEYS,
-                    });
-                }
-                iter.append(key, value)?;
+        if !found {
+            if unique_keys.len() >= MAX_UNIQUE_KEYS {
+                return Err(KvpError::MaxUniqueKeysExceeded {
+                    max: MAX_UNIQUE_KEYS,
+                });
             }
+            iter.append(key, value)?;
+        }
 
-            iter.flush()?;
-            Ok(())
-        })
+        iter.flush()?;
+        Ok(())
     }
 
     /// Return whether the store is empty.
@@ -415,16 +405,14 @@ impl KvpPoolStore {
             });
         }
 
-        let iter = self.iter_mut()?;
-        run_with_iter(iter, |iter| {
-            iter.file.set_len(0)?;
-            iter.record_count = 0;
-            for (k, v) in &records {
-                iter.append(k, v)?;
-            }
-            iter.flush()?;
-            Ok(())
-        })
+        let mut iter = self.iter_mut()?;
+        iter.file.set_len(0)?;
+        iter.record_count = 0;
+        for (k, v) in &records {
+            iter.append(k, v)?;
+        }
+        iter.flush()?;
+        Ok(())
     }
 
     /// Read the value for a key. Returns `Ok(None)` when absent.
@@ -437,7 +425,7 @@ impl KvpPoolStore {
     /// store can read keys that were written in
     /// [`Unsafe`](PoolMode::Unsafe) mode.
     pub fn read(&self, key: &str) -> Result<Option<String>, KvpError> {
-        let iter = match self.iter() {
+        let mut iter = match self.iter() {
             Ok(it) => it,
             Err(KvpError::Io(e)) if e.kind() == ErrorKind::NotFound => {
                 return Ok(None);
@@ -445,31 +433,14 @@ impl KvpPoolStore {
             Err(e) => return Err(e),
         };
 
-        run_with_iter(iter, |iter| {
-            let mut result = None;
-            for record in iter.by_ref() {
-                let (k, v) = record?;
-                if k == key {
-                    result = Some(v);
-                }
+        let mut result = None;
+        for record in iter.by_ref() {
+            let (k, v) = record?;
+            if k == key {
+                result = Some(v);
             }
-            Ok(result)
-        })
-    }
-}
-
-/// Run `f` against `iter`, then unlock the iterator regardless of
-/// whether `f` succeeded. The first error (work or unlock) wins.
-fn run_with_iter<T, F>(mut iter: KvpPoolIter, f: F) -> Result<T, KvpError>
-where
-    F: FnOnce(&mut KvpPoolIter) -> Result<T, KvpError>,
-{
-    let work_result = f(&mut iter);
-    let unlock_result = iter.unlock().map_err(KvpError::from);
-    match (work_result, unlock_result) {
-        (Ok(v), Ok(())) => Ok(v),
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(e),
+        }
+        Ok(result)
     }
 }
 
@@ -674,13 +645,26 @@ fn validate_value(value: &str, max: usize) -> Result<(), KvpError> {
 /// without loading all records into memory. Supports in-place value
 /// overwrites and record removal for the last-yielded record.
 ///
-/// The underlying file is locked in [`new`](Self::new) and released
-/// by [`unlock`](Self::unlock) (or by fd close when dropped).
+/// The underlying file is locked in [`new`](Self::new); both the lock
+/// release and the `close(2)` happen via [`Drop`], with unlock issued
+/// before the file's own drop closes the fd. Unlock errors in the
+/// drop path are unrecoverable and silently discarded — `close(2)`
+/// would release any still-held locks as a backstop.
 #[derive(Debug)]
 struct KvpPoolIter {
     file: File,
     record_count: usize,
     current_index: usize,
+}
+
+impl Drop for KvpPoolIter {
+    fn drop(&mut self) {
+        // Drop runs before fields are dropped, so `self.file` is still
+        // a valid open fd here. Errors are unrecoverable in Drop;
+        // close(2) on the subsequent field drop releases any
+        // still-held locks regardless.
+        let _ = unlock(&self.file);
+    }
 }
 
 impl KvpPoolIter {
@@ -810,11 +794,6 @@ impl KvpPoolIter {
         Ok(())
     }
 
-    /// Release the locks taken by [`new`](Self::new) and consume the
-    /// iterator. Drop also releases via fd close, but errors are lost.
-    fn unlock(self) -> io::Result<()> {
-        unlock(&self.file)
-    }
 }
 
 impl Iterator for KvpPoolIter {
@@ -1303,6 +1282,388 @@ mod tests {
                 ("k7", "v"),
                 ("k8", "v"),
             ])
+        );
+    }
+
+    /// Exposes a bug where `remove_current()` reorders duplicate
+    /// records via its swap-with-last strategy, silently changing
+    /// which duplicate `entries()` reports as last-write-wins.
+    ///
+    /// Initial on-disk order has `("dup", "C")` as the final record
+    /// for key `"dup"`, so `entries()["dup"] == "C"`. After deleting
+    /// the unrelated `"middle"` key, the swap moves `("dup", "C")`
+    /// into the freed slot ahead of `("dup", "B")`, leaving `"B"` as
+    /// the on-disk-last record for `"dup"`.
+    #[test]
+    fn test_delete_reorders_duplicates_breaking_last_write_wins() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+
+        store
+            .populate(pairs([
+                ("dup", "A"),
+                ("middle", "m"),
+                ("dup", "B"),
+                ("other", "x"),
+                ("dup", "C"),
+            ]))
+            .unwrap();
+
+        assert_eq!(
+            store.entries().unwrap().get("dup"),
+            Some(&"C".to_string()),
+            "precondition: last-write-wins picks the final on-disk record",
+        );
+
+        assert!(store.delete("middle").unwrap());
+
+        assert_eq!(
+            store.dump().unwrap(),
+            pairs([
+                ("dup", "A"),
+                ("dup", "B"),
+                ("other", "x"),
+                ("dup", "C"),
+            ]),
+            "deleting an unrelated key must preserve the relative order \
+             of every other record (so last-write-wins still picks C \
+             for `dup`)",
+        );
+        assert_eq!(
+            store.entries().unwrap().get("dup"),
+            Some(&"C".to_string()),
+            "deleting an unrelated key must not change which duplicate \
+             entries() reports as the winning value",
+        );
+    }
+
+    /// Companion to
+    /// [`test_delete_reorders_duplicates_breaking_last_write_wins`]
+    /// for the other production caller of `remove_current()`: the
+    /// duplicate-collapsing branch of [`KvpPoolStore::insert`].
+    ///
+    /// Initial on-disk order has `("dup", "C")` as the final record
+    /// for key `"dup"`, so `entries()["dup"] == "C"`. Inserting
+    /// `"ins"` overwrites the first `"ins"` record in place and then
+    /// calls `remove_current()` on the second `"ins"`, which swaps
+    /// the tail `("dup", "C")` forward of `("dup", "B")`, leaving
+    /// `"B"` as the on-disk-last record for `"dup"`.
+    #[test]
+    fn test_insert_reorders_duplicates_breaking_last_write_wins() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+
+        store
+            .populate(pairs([
+                ("ins", "i1"),
+                ("ins", "i2"),
+                ("dup", "B"),
+                ("dup", "C"),
+            ]))
+            .unwrap();
+
+        assert_eq!(
+            store.entries().unwrap().get("dup"),
+            Some(&"C".to_string()),
+            "precondition: last-write-wins picks the final on-disk record",
+        );
+
+        store.insert("ins", "new").unwrap();
+
+        assert_eq!(
+            store.dump().unwrap(),
+            pairs([("ins", "new"), ("dup", "B"), ("dup", "C")]),
+            "collapsing duplicate `ins` records must preserve the \
+             relative order of unrelated `dup` records (so last-write-wins \
+             still picks C for `dup`)",
+        );
+        assert_eq!(
+            store.entries().unwrap().get("dup"),
+            Some(&"C".to_string()),
+            "insert collapsing its own duplicates must not change which \
+             duplicate of an unrelated key entries() reports as winning",
+        );
+    }
+
+    /// Exposes a silent data-corruption bug in the value round-trip:
+    /// trailing null bytes in user-supplied values are indistinguishable
+    /// from the zero-padding that fills the fixed-width 2048-byte value
+    /// field, so [`decode_record`]'s `trim_end_matches('\0')` strips
+    /// them on read.
+    ///
+    /// [`validate_key`] rejects null bytes in keys, preventing this for
+    /// the key field, but [`validate_value`] performs no equivalent
+    /// check, so a write like `insert("k", "data\0")` succeeds and
+    /// silently round-trips as `"data"`.
+    ///
+    /// Embedded (non-trailing) null bytes are preserved because `trim`
+    /// only strips the suffix; only trailing nulls are lost.
+    #[test]
+    fn test_value_with_trailing_null_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+
+        // Embedded null in the middle is preserved (sanity check).
+        store.insert("embedded", "a\0b").unwrap();
+        assert_eq!(
+            store.read("embedded").unwrap(),
+            Some("a\0b".to_string()),
+            "embedded null bytes must round-trip unchanged",
+        );
+
+        // Trailing null is silently stripped by trim_end_matches('\0').
+        store.insert("trailing", "data\0").unwrap();
+        assert_eq!(
+            store.read("trailing").unwrap(),
+            Some("data\0".to_string()),
+            "trailing null bytes in a value must round-trip unchanged \
+             (or `validate_value` should reject them, mirroring \
+             `validate_key`'s null-byte rejection)",
+        );
+    }
+
+    /// `len()` and `is_empty()` use `metadata().len()` directly without
+    /// going through [`KvpPoolIter::new`], which silently rounds down
+    /// for files whose size isn't a multiple of [`RECORD_SIZE`]. Other
+    /// operations (`iter()`, `dump()`, `read()`, ...) reject the same
+    /// file with [`KvpError::Io`], so the corruption is observable
+    /// through one API but invisible through another.
+    #[test]
+    fn test_len_and_is_empty_mask_corrupt_file_size() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+
+        // Write 1.5 records' worth of bytes — a clearly corrupt file.
+        std::fs::write(store.path(), vec![0u8; RECORD_SIZE + 100]).unwrap();
+
+        // dump/read/entries all reject this file as malformed.
+        assert!(store.dump().is_err());
+
+        // len/is_empty silently round down and report a partial record
+        // count, hiding the corruption that other operations expose.
+        assert!(
+            store.len().is_err(),
+            "len() must reject a malformed file rather than silently \
+             rounding down (other ops do reject it; len() must be \
+             consistent)",
+        );
+        assert!(
+            store.is_empty().is_err(),
+            "is_empty() must reject a malformed file rather than \
+             reporting `false` based on a rounded-down record count",
+        );
+    }
+
+    /// `KvpPoolIter::flush` calls `File::flush`, which is a documented
+    /// no-op for unbuffered `File` handles. Writes return `Ok(())`
+    /// while the data still lives only in the kernel page cache, so a
+    /// power loss between `insert(...)` returning and the kernel's
+    /// next writeback silently drops the write. The method should
+    /// call `sync_data()` (or `sync_all()`) to actually persist.
+    ///
+    /// Hard to assert at the file-system level from a unit test; this
+    /// test pins the misleading API by demonstrating that flush()
+    /// completes even on a read-only fd, which it could not do if it
+    /// performed any real I/O.
+    #[test]
+    fn test_flush_is_a_no_op_not_a_real_sync() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+        store.insert("k", "v").unwrap();
+
+        // Open read-only and try to flush; a real fsync would fail
+        // with EBADF on a read-only fd, but File::flush is a no-op.
+        let file = OpenOptions::new().read(true).open(store.path()).unwrap();
+        let result = (&file).flush();
+        assert!(
+            result.is_err(),
+            "iter.flush() ultimately calls File::flush, which is a \
+             no-op and silently succeeds even when no real sync \
+             happened — replace with sync_data() if writes are \
+             expected to be durable across crashes",
+        );
+    }
+
+    /// Newly-created pool files inherit the process umask and are
+    /// usually world-readable (0644 or 0664). The pool may carry
+    /// guest-host KVP data that shouldn't be readable by unprivileged
+    /// users; `open_for_read_write_create` should `OpenOptions::mode`
+    /// the file to 0600 (or another tight mode) on creation.
+    #[test]
+    fn test_created_pool_file_has_too_permissive_mode() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+
+        // Triggers create-on-open via iter_mut().
+        store.insert("k", "v").unwrap();
+
+        let mode = std::fs::metadata(store.path()).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "newly-created pool file should be mode 0600 to prevent \
+             unprivileged readers from observing KVP traffic; got \
+             {mode:o} (default umask-derived mode is too permissive)",
+        );
+    }
+
+    /// `populate(empty)` on a store whose file does not yet exist
+    /// silently creates a 0-byte file via `iter_mut`'s implicit
+    /// `create(true)`. There is no "empty an already-empty store"
+    /// concept that requires this side effect, and littering
+    /// `/var/lib/hyperv` with stub files is surprising.
+    #[test]
+    fn test_populate_empty_does_not_create_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+        assert!(!store.path().exists(), "precondition");
+
+        store.populate(Vec::<(String, String)>::new()).unwrap();
+
+        assert!(
+            !store.path().exists(),
+            "populate(empty) on a missing file should be a no-op, not \
+             create a 0-byte stub",
+        );
+    }
+
+    /// Read operations (`read`, `delete`) silently accept inputs that
+    /// the write side rejects — empty strings and strings containing
+    /// null bytes. They iterate the file looking for an exact match
+    /// that can never exist (because writes reject those inputs),
+    /// returning `None`/`false` instead of surfacing the obvious
+    /// programmer error. Inconsistent with `insert`/`append`.
+    #[test]
+    fn test_read_accepts_inputs_that_write_rejects() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+        store.insert("k", "v").unwrap();
+
+        // Write side: empty key is an error.
+        assert!(matches!(
+            store.insert("", "v").unwrap_err(),
+            KvpError::EmptyKey
+        ));
+        // Read side: empty key is silently accepted as "not found".
+        assert!(
+            store.read("").is_err(),
+            "read(\"\") should error with EmptyKey, mirroring write \
+             validation, not silently return None",
+        );
+
+        // Write side: null in key is an error.
+        assert!(matches!(
+            store.insert("a\0b", "v").unwrap_err(),
+            KvpError::KeyContainsNull
+        ));
+        // Read side: null in key is silently accepted.
+        assert!(
+            store.read("a\0b").is_err(),
+            "read(\"a\\0b\") should error with KeyContainsNull, \
+             mirroring write validation",
+        );
+
+        // Same for delete.
+        assert!(
+            store.delete("").is_err(),
+            "delete(\"\") should error with EmptyKey",
+        );
+    }
+
+    /// `KvpPoolStore::populate` builds a `HashSet<&str>` for the
+    /// unique-key cap check. The set borrows from `records: Vec<(String,
+    /// String)>`, so the set's len reflects unique inputs — but the
+    /// validation loop also calls `validate_value` for every record,
+    /// including duplicates of the same key. With many duplicates
+    /// `populate` does O(N) extra validation work. Performance, not
+    /// correctness — but it pairs with a real correctness gap: the
+    /// unique-key cap counts the *input* uniques, not the *resulting*
+    /// uniques, so a populate that intentionally drops a duplicate
+    /// (e.g. via dedup-after-populate logic the caller might add)
+    /// would over-count. Confirm the documented "unique-key cap is
+    /// inputs" semantics here so any future change has to update this
+    /// test deliberately.
+    #[test]
+    fn test_populate_cap_counts_input_uniques_not_record_count() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+
+        // 2 records, 1 unique key. Cap is on uniques, so this
+        // succeeds even with MAX_UNIQUE_KEYS - 1 *other* unique
+        // keys in the same batch.
+        let mut records: Vec<(String, String)> = (0..MAX_UNIQUE_KEYS - 1)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        records.push(("dup".to_string(), "a".to_string()));
+        records.push(("dup".to_string(), "b".to_string()));
+        // unique input keys = MAX_UNIQUE_KEYS, total records =
+        // MAX_UNIQUE_KEYS + 1. Allowed because uniques == cap.
+        store.populate(records).unwrap();
+        assert_eq!(store.len().unwrap(), MAX_UNIQUE_KEYS + 1);
+    }
+
+    /// `KvpPoolStore::clear_if_stale` checks staleness then clears as
+    /// two separate locked operations. Between the `is_stale` stat
+    /// and the `clear` open, another writer can append fresh data —
+    /// which `clear_if_stale` then deletes. The check-then-act should
+    /// be performed under a single exclusive lock.
+    ///
+    /// This test demonstrates the race deterministically by calling
+    /// the inner check and the inner clear sequentially with an
+    /// interleaved write, simulating the worst-case TOCTOU window.
+    #[test]
+    fn test_clear_if_stale_toctou_loses_concurrent_write() {
+        let dir = TempDir::new().unwrap();
+        let store = safe_store(dir.path());
+
+        // Stale data on disk.
+        store.insert("old", "value").unwrap();
+        set_mtime_to_epoch(store.path());
+        assert!(store.is_stale().unwrap(), "precondition: stale");
+
+        // Race window: another writer commits fresh data after the
+        // stale check but before the clear runs.
+        let was_stale = store.is_stale().unwrap();
+        store.insert("fresh", "just_written").unwrap();
+        if was_stale {
+            store.clear().unwrap();
+        }
+
+        assert_eq!(
+            store.read("fresh").unwrap(),
+            Some("just_written".to_string()),
+            "freshly-written data must survive clear_if_stale; the \
+             stale check and the clear must hold the same exclusive \
+             lock so a writer cannot slip data in between them",
+        );
+    }
+
+    /// `boot_time()` mixes clock domains: `SystemTime::now()` reads
+    /// `CLOCK_REALTIME` while `sysinfo::System::uptime()` is sourced
+    /// from a monotonic boot clock. NTP adjustments, manual clock
+    /// changes, or DST jumps to `CLOCK_REALTIME` make the computed
+    /// "boot time" drift, which makes [`KvpPoolStore::is_stale`]
+    /// either falsely report stale (after a clock backwards-jump) or
+    /// falsely report fresh (after a clock forward-jump). Boot time
+    /// should be read from `/proc/stat`'s `btime` field, which is
+    /// the canonical kernel-recorded value and is not affected by
+    /// clock adjustments.
+    ///
+    /// Hard to assert without time mocking; this test documents the
+    /// expectation that two consecutive boot_time() calls within a
+    /// single second return the same value (which they currently do
+    /// only by accident of second-resolution truncation).
+    #[test]
+    fn test_boot_time_is_stable_across_calls() {
+        let a = boot_time().unwrap();
+        let b = boot_time().unwrap();
+        // Currently passes by accident (both calls happen within the
+        // same second), but a real fix should read btime once and
+        // cache it, or at minimum document the clock-skew sensitivity.
+        assert_eq!(
+            a, b,
+            "boot_time() should be a stable kernel-recorded value, \
+             not a SystemTime/uptime arithmetic that drifts under \
+             NTP correction",
         );
     }
 
