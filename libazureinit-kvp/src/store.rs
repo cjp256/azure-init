@@ -1026,7 +1026,7 @@ mod tests {
             WriteOp::Populate => store.populate(pairs([(key, value)])),
         }
         .unwrap_err();
-        assert_eq!(KvpErrKind::of(&err), expected);
+        assert!(expected.matches(&err), "got: {err:?}");
     }
 
     #[derive(Clone, Copy)]
@@ -1055,7 +1055,9 @@ mod tests {
         Populate,
     }
 
-    /// Compact view of [`KvpError`] for parametrized variant assertions.
+    /// Discriminant tag for the [`KvpError`] variants asserted by
+    /// parametrized tests. Cases use one tag per variant so the test
+    /// only needs to compare discriminants, not pattern-match.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum KvpErrKind {
         EmptyKey,
@@ -1064,13 +1066,13 @@ mod tests {
     }
 
     impl KvpErrKind {
-        fn of(err: &KvpError) -> Self {
-            match err {
-                KvpError::EmptyKey => Self::EmptyKey,
-                KvpError::KeyContainsNull => Self::KeyContainsNull,
-                KvpError::ValueContainsNull => Self::ValueContainsNull,
-                other => panic!("unexpected KvpError variant: {other:?}"),
-            }
+        fn matches(self, err: &KvpError) -> bool {
+            matches!(
+                (self, err),
+                (Self::EmptyKey, KvpError::EmptyKey)
+                    | (Self::KeyContainsNull, KvpError::KeyContainsNull)
+                    | (Self::ValueContainsNull, KvpError::ValueContainsNull)
+            )
         }
     }
 
@@ -1339,13 +1341,13 @@ mod tests {
                 assert!(store.entries().unwrap().is_empty());
             }
             StoreOp::Dump => assert!(store.dump().unwrap().is_empty()),
-            StoreOp::Populate => unreachable!(
-                "populate creates the file, so missing-file is not a sentinel"
-            ),
             StoreOp::Len => assert_eq!(store.len().unwrap(), 0),
             StoreOp::IsStale => assert!(!store.is_stale().unwrap()),
             StoreOp::IsStaleAtBoot => {
                 assert!(!store.is_stale_at_boot(i64::MAX).unwrap());
+            }
+            StoreOp::Populate | StoreOp::Insert | StoreOp::Append => {
+                unreachable!("write ops not in this test's case list")
             }
         }
         assert!(!store.path().exists());
@@ -2337,6 +2339,8 @@ mod tests {
         Len,
         IsStale,
         IsStaleAtBoot,
+        Insert,
+        Append,
     }
 
     /// Every fallible read/write op surfaces an unreachable directory
@@ -2352,6 +2356,8 @@ mod tests {
     #[case::len(StoreOp::Len)]
     #[case::is_stale(StoreOp::IsStale)]
     #[case::is_stale_at_boot(StoreOp::IsStaleAtBoot)]
+    #[case::insert(StoreOp::Insert)]
+    #[case::append(StoreOp::Append)]
     fn test_permission_denied(#[case] op: StoreOp) {
         let dir = TempDir::new().unwrap();
         let store = safe_store(dir.path());
@@ -2371,6 +2377,8 @@ mod tests {
             StoreOp::IsStaleAtBoot => {
                 store.is_stale_at_boot(i64::MAX).map(|_| ())
             }
+            StoreOp::Insert => store.insert("k2", "v2"),
+            StoreOp::Append => store.append("k", "v"),
         };
         unlock_dir(dir.path());
         assert!(matches!(result.unwrap_err(), KvpError::Io(_)));
