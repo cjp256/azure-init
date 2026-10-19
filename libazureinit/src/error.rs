@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::health::encode_report;
+use libazureinit_kvp::{ProvisioningReport, ReportPpsType};
 use std::collections::HashMap;
 
 /// Set of error codes that can be used by libazureinit.
@@ -162,21 +162,17 @@ impl Error {
     /// `vm_id`, `timestamp`, and documentation URL.
     pub fn as_encoded_report(&self, vm_id: &str) -> String {
         let agent = format!("Azure-Init/{}", env!("CARGO_PKG_VERSION"));
-        let timestamp = chrono::Utc::now();
-
-        let mut data = vec![
-            "result=error".to_string(),
-            format!("reason={}", self.reason()),
-            format!("agent={agent}"),
-        ];
+        let mut report = ProvisioningReport::failure(
+            agent,
+            vm_id,
+            self.reason(),
+            ReportPpsType::None,
+        )
+        .with_documentation_url(Self::DOCUMENTATION_URL);
         for (k, v) in self.supporting_data() {
-            data.push(format!("{k}={v}"));
+            report = report.with_extra(k, v);
         }
-        data.push("pps_type=None".to_string());
-        data.push(format!("vm_id={vm_id}"));
-        data.push(format!("timestamp={}", timestamp.to_rfc3339()));
-        data.push(format!("documentation_url={}", Self::DOCUMENTATION_URL));
-        encode_report(&data)
+        report.to_string()
     }
 }
 

@@ -92,7 +92,8 @@ impl std::fmt::Display for ReportPpsType {
 ///
 /// [`success`](Self::success) and [`failure`](Self::failure) capture the current
 /// time. Add optional context with the builder methods, then call
-/// [`write_report`] to persist it. Existing stored reports can be parsed with
+/// [`write_report`] to persist it, or [`to_string`](Self::to_string) to encode it.
+/// Existing stored reports can be parsed with
 /// [`str::parse`]; parsing preserves their timestamps.
 ///
 /// See the [provisioning report contract] for the stored format.
@@ -372,6 +373,12 @@ impl ProvisioningReport {
     }
 }
 
+impl std::fmt::Display for ProvisioningReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.encode())
+    }
+}
+
 /// Stores a provisioning result, replacing any existing report in the pool.
 ///
 /// A report must fit in one value under the store's configured size policy.
@@ -463,6 +470,7 @@ mod tests {
         #[case] expected: &str,
     ) {
         assert_eq!(report.encode(), expected);
+        assert_eq!(report.to_string(), expected);
         assert_eq!(expected.parse::<ProvisioningReport>().unwrap(), report);
     }
 

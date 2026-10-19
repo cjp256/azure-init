@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use libazureinit_kvp::{KvpPool, KvpPoolStore, PoolMode};
 use opentelemetry::{global, trace::TracerProvider};
 use opentelemetry_sdk::trace::{self as sdktrace, Sampler, SdkTracerProvider};
 use std::fs::{OpenOptions, Permissions};
@@ -153,7 +154,7 @@ struct KvpLayer<S: Subscriber>(Filtered<EmitKVPLayer, EnvFilter, S>);
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
-/// let mut kvp = Kvp::new("a-unique-id")?;
+/// let mut kvp = Kvp::new("00000000-0000-0000-0000-000000000abc")?;
 /// let registry = tracing_subscriber::Registry::default().with(kvp.layer());
 ///
 /// // When it's time to shut down, doing this ensures all writes are flushed
@@ -177,7 +178,7 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Kvp<S> {
     pub fn new<T: AsRef<str>>(vm_id: T) -> Result<Self, anyhow::Error> {
         let shutdown = CancellationToken::new();
         let inner = KvpInternal::new(
-            std::path::PathBuf::from("/var/lib/hyperv/.kvp_pool_1"),
+            KvpPoolStore::new(KvpPool::Guest, PoolMode::Safe)?,
             vm_id.as_ref(),
             shutdown.clone(),
         )?;
@@ -242,7 +243,7 @@ pub fn setup_layers(
         .kvp_diagnostics
     {
         match KvpInternal::new(
-            std::path::PathBuf::from("/var/lib/hyperv/.kvp_pool_1"),
+            KvpPoolStore::new(KvpPool::Guest, PoolMode::Safe)?,
             vm_id,
             graceful_shutdown,
         ) {

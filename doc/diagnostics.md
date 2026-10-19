@@ -6,6 +6,17 @@ EG and LPA: operations, observations and artifacts such as logs. The
 
 ## Record Format
 
+The azure-init tracing adapter uses `libazureinit-kvp` to write diagnostics.
+Spans emit a start and finish with a shared event ID; error events mark their
+enclosing spans as failed. Events outside spans are still ignored, except for
+final health reports. The existing KVP filters and shutdown queue draining still
+apply.
+
+Final health reports use `ProvisioningReport` and replace the existing
+`PROVISIONING_REPORT` record through `write_report`. In-progress health updates
+are diagnostic events, not final provisioning reports. WireServer reporting is
+unchanged.
+
 Native diagnostics are appended to guest pool 1. A diagnostic occupies one or
 more records. Each key has exactly eleven pipe-delimited fields:
 

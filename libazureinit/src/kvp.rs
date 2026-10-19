@@ -1,285 +1,178 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! This module provides core functionality for handling telemetry tracing
-//! related to azure-init's interaction with Hyper-V KVP (Key-Value Pair) storage.
-//!
-//! # Constants
-//! - `HV_KVP_EXCHANGE_MAX_KEY_SIZE`: Defines the maximum key size for KVP exchange.
-//! - `HV_KVP_EXCHANGE_MAX_VALUE_SIZE`: Defines the maximum value size for KVP exchange.
-//! - `HV_KVP_AZURE_MAX_VALUE_SIZE`: Maximum value size before splitting into multiple slices.
-//!
+//! Adapts tracing spans and events to libazureinit-kvp diagnostics.
 
 use std::{
-    fmt::{self as std_fmt, Write as std_write},
-    fs::{File, OpenOptions},
-    io::{self, ErrorKind, Write},
-    os::unix::fs::MetadataExt,
-    path::Path,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    fmt::{self, Write},
+    fs::OpenOptions,
+    io,
+    time::{Duration, Instant},
 };
 
-use fs2::FileExt;
-
-use tracing::{
-    field::Visit,
-    span::{Attributes, Id},
-    Subscriber,
+use libazureinit_kvp::{
+    write_report, DiagnosticWriter, KvpPoolStore, Outcome, ProvisioningReport,
 };
-
-use tracing_subscriber::{
-    layer::Context as TracingContext, registry::LookupSpan, Layer,
-};
-
-use sysinfo::System;
-
 use tokio::{
-    sync::{mpsc::UnboundedReceiver, mpsc::UnboundedSender},
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-
-use chrono::{DateTime, Utc};
+use tracing::{
+    field::{Field, Visit},
+    span::{Attributes, Id},
+    Subscriber,
+};
+use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 use uuid::Uuid;
 
-const HV_KVP_EXCHANGE_MAX_KEY_SIZE: usize = 512;
-const HV_KVP_EXCHANGE_MAX_VALUE_SIZE: usize = 2048;
-const HV_KVP_AZURE_MAX_VALUE_SIZE: usize = 1022;
-const EVENT_PREFIX: &str = concat!("azure-init-", env!("CARGO_PKG_VERSION"));
-
-/// Encapsulates the KVP (Key-Value Pair) tracing infrastructure.
-///
-/// This struct holds both the `tracing` layer (`EmitKVPLayer`) that generates
-/// telemetry data and the `JoinHandle` for the background task that writes this
-/// data to the KVP file. This allows the caller to manage the lifecycle of the
-/// writer task separately from the tracing layer.
 pub struct Kvp {
-    /// The `tracing` layer that captures span and event data and sends it
-    /// to the KVP writer task.
     pub(crate) tracing_layer: EmitKVPLayer,
-    /// The `JoinHandle` for the background task responsible for writing
-    /// KVP data to the file. The caller can use this handle to wait for
-    /// the writer to finish.
     pub(crate) writer: JoinHandle<io::Result<()>>,
 }
 
+enum Message {
+    Start {
+        id: String,
+        name: String,
+        payload: String,
+    },
+    Finish {
+        id: String,
+        name: String,
+        outcome: Outcome,
+        duration: Duration,
+    },
+    Event {
+        name: String,
+        payload: String,
+        outcome: Option<Outcome>,
+    },
+    Report(ProvisioningReport),
+}
+
 impl Kvp {
-    /// Creates a new `Kvp` instance, spawning a background task for writing
-    /// KVP telemetry data to a file.
-    ///
-    /// This function initializes the necessary components for KVP logging:
-    /// - It truncates the KVP file if it contains stale data.
-    /// - It creates an unbounded channel for passing encoded KVP data from the
-    ///   tracing layer to the writer task.
-    /// - It spawns the `kvp_writer` task, which listens for data and shutdown signals.
     pub(crate) fn new(
-        file_path: std::path::PathBuf,
+        store: KvpPoolStore,
         vm_id: &str,
         graceful_shutdown: CancellationToken,
     ) -> Result<Self, anyhow::Error> {
-        truncate_guest_pool_file(&file_path)?;
-
-        let file = OpenOptions::new()
+        let diagnostics = DiagnosticWriter::new(
+            store.clone(),
+            concat!("azure-init/", env!("CARGO_PKG_VERSION")),
+            vm_id,
+        )?;
+        store.clear_if_stale()?;
+        OpenOptions::new()
             .append(true)
             .create(true)
-            .open(&file_path)?;
-
-        let (events_tx, events_rx): (
-            UnboundedSender<Vec<u8>>,
-            UnboundedReceiver<Vec<u8>>,
-        ) = tokio::sync::mpsc::unbounded_channel();
-
-        let writer =
-            tokio::spawn(Self::kvp_writer(file, events_rx, graceful_shutdown));
-
+            .open(store.path())?;
+        let (events_tx, events_rx) = unbounded_channel();
+        let writer = tokio::spawn(Self::kvp_writer(
+            store,
+            diagnostics,
+            events_rx,
+            graceful_shutdown,
+        ));
         Ok(Self {
-            tracing_layer: EmitKVPLayer {
-                events_tx,
-                vm_id: vm_id.to_string(),
-            },
+            tracing_layer: EmitKVPLayer { events_tx },
             writer,
         })
     }
 
-    /// The background task that writes encoded KVP data to a file.
-    ///
-    /// This asynchronous function runs in a loop, waiting for two events:
-    /// 1. Receiving encoded KVP data from the `events` channel, which it then
-    ///    writes to the specified `file`.
-    /// 2. A cancellation signal from the `token`.
-    ///
-    /// Upon receiving the cancellation signal, it stops accepting new events,
-    /// drains the `events` channel of any remaining messages, and writes them
-    /// to the file before exiting gracefully.
-    ///
-    /// KVP messages are batched together to minimize the number of lock/unlock
-    /// and flush operations, improving efficiency.
     async fn kvp_writer(
-        mut file: File,
-        mut events: UnboundedReceiver<Vec<u8>>,
+        store: KvpPoolStore,
+        diagnostics: DiagnosticWriter,
+        mut events: UnboundedReceiver<Message>,
         token: CancellationToken,
     ) -> io::Result<()> {
+        let mut first_error = None;
         loop {
-            tokio::select! {
-                biased;
-
-                Some(encoded_kvp) = events.recv() => {
-                    // Collect this message and any other immediately available ones
-                    let mut batch = vec![encoded_kvp];
-                    while let Ok(kvp) = events.try_recv() {
-                        batch.push(kvp);
-                    }
-
-                    if let Err(e) = Self::write_kvps(&mut file, &batch) {
-                        eprintln!("Failed to write KVP batch: {e}");
-                    }
-                }
-
-                _ = token.cancelled() => {
-                    // Shutdown signal received.
-                    // close the channel and drain remaining messages.
+            let message = tokio::select! {
+                _ = token.cancelled(), if !events.is_closed() => {
                     events.close();
-
-                    let mut batch = Vec::new();
-                    while let Some(encoded_kvp) = events.recv().await {
-                        batch.push(encoded_kvp);
-                    }
-
-                    if !batch.is_empty() {
-                        if let Err(e) = Self::write_kvps(&mut file, &batch) {
-                            eprintln!("Failed to write KVP batch during shutdown: {e}");
-                        }
-                    }
-
-                    // All messages are drained, exit the loop.
-                    break;
+                    continue;
                 }
+                message = events.recv() => message,
+            };
+            let Some(message) = message else { break };
+            let result = match message {
+                Message::Start { id, name, payload } => {
+                    diagnostics.emit_start(&id, &name, payload, None)
+                }
+                Message::Finish {
+                    id,
+                    name,
+                    outcome,
+                    duration,
+                } => diagnostics
+                    .emit_finish(&id, &name, "", None, outcome, duration),
+                Message::Event {
+                    name,
+                    payload,
+                    outcome,
+                } => {
+                    diagnostics.emit_event(&name, payload, None, outcome, None)
+                }
+                Message::Report(report) => write_report(&store, &report),
+            };
+            if let Err(error) = result {
+                // Logging through tracing here would feed this same queue.
+                eprintln!("Failed to write KVP telemetry: {error}");
+                first_error.get_or_insert_with(|| io::Error::other(error));
             }
         }
-        Ok(())
-    }
-
-    /// Writes a batch of KVP messages to the file with a single lock/unlock cycle.
-    ///
-    /// This method takes the exclusive lock once, writes all messages in the batch,
-    /// flushes once, and then unlocks.
-    ///
-    /// # Arguments
-    /// * `file` - A mutable reference to the file to write to.
-    /// * `kvps` - A slice of encoded KVP messages to write.
-    fn write_kvps(file: &mut File, kvps: &[Vec<u8>]) -> io::Result<()> {
-        FileExt::lock_exclusive(file).map_err(|e| {
-            io::Error::other(format!("Failed to lock KVP file: {e}"))
-        })?;
-
-        let write_result = (|| -> io::Result<()> {
-            for kvp in kvps {
-                file.write_all(kvp)?;
-            }
-            file.flush()
-        })();
-
-        let unlock_result = FileExt::unlock(file).map_err(|e| {
-            io::Error::other(format!("Failed to unlock KVP file: {e}"))
-        });
-
-        // Make sure the exclusive lock is released even when writing or flushing fails.
-        if let Err(err) = write_result {
-            if let Err(ref unlock_err) = unlock_result {
-                eprintln!("Failed to unlock KVP file after write failure: {unlock_err}");
-            }
-            return Err(err);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-
-        unlock_result
     }
 }
 
-/// A wrapper around `std::time::Instant` that provides convenient methods
-/// for time tracking in spans and events. Implements the `Deref` trait, allowing
-/// access to the underlying `Instant` methods.
-///
-/// This struct captures the start time of spans/events and measures the elapsed time.
-#[derive(Clone)]
-struct MyInstant(Instant);
-
-impl std::ops::Deref for MyInstant {
-    type Target = Instant;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl MyInstant {
-    pub fn now() -> Self {
-        MyInstant(Instant::now())
-    }
+struct SpanState {
+    id: String,
+    started: Instant,
+    outcome: Outcome,
 }
 
-/// A custom visitor that captures the value of the `msg` field from a tracing event.
-/// It implements the `tracing::field::Visit` trait and records the value into
-/// a provided mutable string reference.
-///
-/// This visitor is primarily used in the `on_event` method of the `EmitKVPLayer`
-/// to extract event messages and log them as key-value pairs.
-pub struct StringVisitor<'a> {
-    string: &'a mut String,
+#[derive(Default)]
+struct StringVisitor {
+    message: String,
+    report: Option<String>,
 }
 
-impl Visit for StringVisitor<'_> {
-    /// Records the debug representation of the event's value and stores it in the provided string.
-    ///
-    /// # Arguments
-    /// * `_field` - A reference to the event's field metadata.
-    /// * `value` - The debug value associated with the field.
-    fn record_debug(
-        &mut self,
-        field: &tracing::field::Field,
-        value: &dyn std_fmt::Debug,
-    ) {
-        if !self.string.is_empty() {
-            self.string.push_str(", ");
+impl Visit for StringVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "health_report" {
+            self.report = Some(value.to_owned());
+        } else {
+            self.record_debug(field, &value);
         }
-        write!(self.string, "{}={:?}", field.name(), value)
-            .expect("Writing to a string should never fail");
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "health_report" {
+            self.report = Some(format!("{value:?}"));
+            return;
+        }
+        if !self.message.is_empty() {
+            self.message.push_str(", ");
+        }
+        write!(self.message, "{}={value:?}", field.name())
+            .expect("writing to a string cannot fail");
     }
 }
 
-/// A custom tracing layer that emits span and event data as key-value pairs (KVP)
-/// to a file for Hyper-V telemetry consumption. The layer manages the asynchronous
-/// writing of telemetry data to a specified file in KVP format.
-///
-/// `EmitKVPLayer` initializes the file at creation, manages a dedicated writer
-/// task, and provides functions to send encoded data for logging.
+/// Queues tracing data for the KVP writer task.
 pub struct EmitKVPLayer {
-    events_tx: UnboundedSender<Vec<u8>>,
-    vm_id: String,
+    events_tx: UnboundedSender<Message>,
 }
 
 impl EmitKVPLayer {
-    /// Sends encoded KVP data to the writer task for asynchronous logging.
-    ///
-    /// # Arguments
-    /// * `message` - The encoded data to send as a vector of bytes (Vec<u8>).
-    fn send_event(&self, message: Vec<u8>) {
-        let _ = self.events_tx.send(message);
-    }
-
-    /// Handles the orchestration of key-value pair (KVP) encoding and logging operations
-    /// by generating a unique event key, encoding it with the provided value, and sending
-    /// it to the `EmitKVPLayer` for logging.
-    fn handle_kvp_operation(
-        &self,
-        event_level: &str,
-        event_name: &str,
-        span_id: &str,
-        event_value: &str,
-    ) {
-        let event_key =
-            generate_event_key(&self.vm_id, event_level, event_name, span_id);
-        let encoded_kvp = encode_kvp_item(&event_key, event_value);
-        let encoded_kvp_flattened: Vec<u8> = encoded_kvp.concat();
-        self.send_event(encoded_kvp_flattened);
+    fn send(&self, message: Message) {
+        if let Err(error) = self.events_tx.send(message) {
+            eprintln!("Failed to queue KVP telemetry: {error}");
+        }
     }
 }
 
@@ -287,314 +180,84 @@ impl<S> Layer<S> for EmitKVPLayer
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    /// Handles event occurrences within a span, capturing and recording the event's message
-    /// and context metadata as key-value pairs (KVP) for logging.
-    ///
-    /// This function extracts the event's `msg` field using `StringVisitor`, constructs a
-    /// formatted event string, and then encodes it as KVP data to be sent to the
-    /// `EmitKVPLayer` for asynchronous file storage.
-    ///
-    /// If an `ERROR` level event is encountered, it marks the span's status as a failure,
-    /// which will be reflected in the span's data upon closure.
-    ///
-    /// Additionally, this function checks if the event contains a `health_report` field.
-    /// If present, the event is delegated to [`handle_health_report`] to be uniquely formatted.
-    ///
-    /// # Arguments
-    /// * `event` - The tracing event instance containing the message and metadata.
-    /// * `ctx` - The current tracing context, which is used to access the span associated
-    ///   with the event.
-    ///
-    /// # Example
-    /// ```rust
-    /// use tracing::{event, Level};
-    /// event!(Level::INFO, msg = "Event message");
-    /// ```
-    fn on_event(&self, event: &tracing::Event<'_>, ctx: TracingContext<'_, S>) {
-        // Check for health_report events, as they exist outside of a span.
-        let mut health_report = None;
-        event.record(
-            &mut |field: &tracing::field::Field,
-                  value: &dyn std::fmt::Debug| {
-                if field.name() == "health_report" {
-                    health_report = Some(
-                        format!("{value:?}").trim_matches('"').to_string(),
-                    );
-                }
-            },
-        );
-
-        if let Some(report_str) = health_report {
-            let msg =
-                encode_kvp_item("PROVISIONING_REPORT", &report_str).concat();
-            self.send_event(msg);
-            return;
-        }
-
-        // All other events are inside a span.
-        if let Some(span) = ctx.lookup_current() {
-            let mut event_message = String::new();
-            let mut visitor = StringVisitor {
-                string: &mut event_message,
-            };
-            event.record(&mut visitor);
-
-            let span_context = span.metadata();
-            let span_id: Uuid = Uuid::new_v4();
-
-            let event_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|_| {
-                    span.extensions()
-                        .get::<MyInstant>()
-                        .map(|instant| instant.elapsed())
-                        .unwrap_or_default()
-                });
-
-            let event_time_dt = DateTime::<Utc>::from(UNIX_EPOCH + event_time)
-                .format("%Y-%m-%dT%H:%M:%S%.3fZ");
-
-            let event_value =
-                format!("Time: {event_time_dt} | Event: {event_message}");
-
-            let formatted_span_name = format_span_name(span_context);
-            self.handle_kvp_operation(
-                event.metadata().level().as_str(),
-                &formatted_span_name,
-                &span_id.to_string(),
-                &event_value,
-            );
-        }
-    }
-
-    /// Called when a new span is created. Records the start time of the span
-    /// and stores it as an extension within the span's context, to be used
-    /// for generating telemetry data for Hyper-V.
     fn on_new_span(
         &self,
         _attrs: &Attributes<'_>,
         id: &Id,
-        ctx: TracingContext<'_, S>,
+        ctx: Context<'_, S>,
     ) {
-        let start_instant = MyInstant::now();
         if let Some(span) = ctx.span(id) {
-            span.extensions_mut().insert(start_instant);
+            let state = SpanState {
+                id: Uuid::new_v4().to_string(),
+                started: Instant::now(),
+                outcome: Outcome::Success,
+            };
+            self.send(Message::Start {
+                id: state.id.clone(),
+                name: format_span_name(span.metadata()),
+                payload: String::new(),
+            });
+            span.extensions_mut().insert(state);
         }
     }
-    /// Called when a span is closed, finalizing and logging the span's data. This method
-    /// records the span's start and end times, status (e.g., success or failure), and other metadata,
-    /// then sends it to `EmitKVPLayer` for KVP logging.
-    ///
-    /// If any errors were recorded in the span (such as `ERROR` level events), the span
-    /// status is marked as `Failure`; otherwise, it is marked as `Success`.
-    ///
-    /// # Arguments
-    /// * `id` - The unique identifier for the span.
-    /// * `ctx` - The current tracing context, used to access the span's metadata and status.
-    fn on_close(&self, id: Id, ctx: TracingContext<S>) {
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        let failed = *event.metadata().level() == tracing::Level::ERROR;
+        if failed {
+            if let Some(span) = ctx.lookup_current() {
+                for span in span.scope() {
+                    if let Some(state) =
+                        span.extensions_mut().get_mut::<SpanState>()
+                    {
+                        state.outcome = Outcome::Failure;
+                    }
+                }
+            }
+        }
+
+        let mut visitor = StringVisitor::default();
+        event.record(&mut visitor);
+        if let Some(report) = visitor.report {
+            match report.parse() {
+                Ok(report) => self.send(Message::Report(report)),
+                Err(error) => {
+                    eprintln!("Invalid KVP provisioning report: {error}");
+                }
+            }
+            return;
+        }
+
+        if let Some(span) = ctx.lookup_current() {
+            self.send(Message::Event {
+                name: format_span_name(span.metadata()),
+                payload: visitor.message,
+                outcome: failed.then_some(Outcome::Failure),
+            });
+        }
+    }
+
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(&id) {
-            let end_time = SystemTime::now();
-
-            let span_context = span.metadata();
-            let span_id = Uuid::new_v4();
-
-            if let Some(start_instant) = span.extensions().get::<MyInstant>() {
-                let elapsed = start_instant.elapsed();
-
-                let start_time =
-                    end_time.checked_sub(elapsed).unwrap_or(UNIX_EPOCH);
-
-                let start_time_dt = DateTime::<Utc>::from(start_time)
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ");
-
-                let end_time_dt = DateTime::<Utc>::from(end_time)
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ");
-
-                let event_value =
-                    format!("Start: {start_time_dt} | End: {end_time_dt}");
-
-                let formatted_span_name = format_span_name(span_context);
-                self.handle_kvp_operation(
-                    span_context.level().as_str(),
-                    &formatted_span_name,
-                    &span_id.to_string(),
-                    &event_value,
-                );
+            if let Some(state) = span.extensions().get::<SpanState>() {
+                self.send(Message::Finish {
+                    id: state.id.clone(),
+                    name: format_span_name(span.metadata()),
+                    outcome: state.outcome,
+                    duration: state.started.elapsed(),
+                });
             }
         }
     }
 }
 
-/// Generates a unique event key by combining the event level, name, and span ID.
-///
-/// # Arguments
-/// * `event_level` - The logging level (e.g., "INFO", "DEBUG").
-/// * `event_name` - The name of the event.
-/// * `span_id` - A unique identifier for the span.
-fn generate_event_key(
-    vm_id: &str,
-    event_level: &str,
-    event_name: &str,
-    span_id: &str,
-) -> String {
-    format!("{EVENT_PREFIX}|{vm_id}|{event_level}|{event_name}|{span_id}")
-}
-
-/// Encodes a key-value pair (KVP) into one or more byte slices. If the value
-/// exceeds the allowed size, it is split into multiple slices for encoding.
-/// This is used for logging events to a KVP file.
-///
-/// # Note
-/// - The key is zero-padded to `HV_KVP_EXCHANGE_MAX_KEY_SIZE`, and
-///   the value is zero-padded to `HV_KVP_AZURE_MAX_VALUE_SIZE` to meet
-///   Hyper-V's expected formatting.
-///
-/// # Arguments
-/// * `key` - The key as a string slice.
-/// * `value` - The value associated with the key.
-fn encode_kvp_item(key: &str, value: &str) -> Vec<Vec<u8>> {
-    let key_buf = key
-        .as_bytes()
-        .iter()
-        .take(HV_KVP_EXCHANGE_MAX_KEY_SIZE)
-        .chain(
-            vec![0_u8; HV_KVP_EXCHANGE_MAX_KEY_SIZE.saturating_sub(key.len())]
-                .iter(),
-        )
-        .copied()
-        .collect::<Vec<_>>();
-
-    debug_assert!(key_buf.len() == HV_KVP_EXCHANGE_MAX_KEY_SIZE);
-
-    let kvp_slices = value
-        .as_bytes()
-        .chunks(HV_KVP_AZURE_MAX_VALUE_SIZE)
-        .map(|chunk| {
-            let mut buffer = Vec::with_capacity(
-                HV_KVP_EXCHANGE_MAX_KEY_SIZE + HV_KVP_EXCHANGE_MAX_VALUE_SIZE,
-            );
-            buffer.extend_from_slice(&key_buf);
-            buffer.extend_from_slice(chunk);
-            while buffer.len()
-                < HV_KVP_EXCHANGE_MAX_KEY_SIZE + HV_KVP_EXCHANGE_MAX_VALUE_SIZE
-            {
-                buffer.push(0);
-            }
-
-            buffer
-        })
-        .collect::<Vec<Vec<u8>>>();
-
-    debug_assert!(kvp_slices.iter().all(|kvp| kvp.len()
-        == HV_KVP_EXCHANGE_MAX_KEY_SIZE + HV_KVP_EXCHANGE_MAX_VALUE_SIZE));
-
-    kvp_slices
-}
-
-/// Decodes a KVP byte slice into its corresponding key and value strings.
-/// This is useful for inspecting or logging raw KVP data.
-#[cfg(test)]
-pub fn decode_kvp_item(
-    record_data: &[u8],
-) -> Result<(String, String), &'static str> {
-    let record_data_len = record_data.len();
-    let expected_len =
-        HV_KVP_EXCHANGE_MAX_KEY_SIZE + HV_KVP_EXCHANGE_MAX_VALUE_SIZE;
-
-    if record_data_len != expected_len {
-        return Err("record_data len not correct.");
-    }
-
-    let key = String::from_utf8(
-        record_data
-            .iter()
-            .take(HV_KVP_EXCHANGE_MAX_KEY_SIZE)
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_else(|_| String::new())
-    .trim_end_matches('\x00')
-    .to_string();
-
-    let value = String::from_utf8(
-        record_data
-            .iter()
-            .skip(HV_KVP_EXCHANGE_MAX_KEY_SIZE)
-            .take(HV_KVP_AZURE_MAX_VALUE_SIZE)
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_else(|_| String::new())
-    .trim_end_matches('\x00')
-    .to_string();
-
-    Ok((key, value))
-}
-
-/// Truncates the guest pool KVP file if it contains stale data (i.e., data
-/// older than the system's boot time). Logs whether the file was truncated
-/// or no action was needed.
-fn truncate_guest_pool_file(kvp_file: &Path) -> Result<(), anyhow::Error> {
-    let boot_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
-        - get_uptime().as_secs();
-
-    match kvp_file.metadata() {
-        Ok(metadata) => {
-            if metadata.mtime() < boot_time as i64 {
-                OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(kvp_file)?;
-                println!("Truncated the KVP file due to stale data.");
-            } else {
-                println!(
-                    "File has been truncated since boot, no action taken."
-                );
-            }
-        }
-        Err(ref e) if e.kind() == ErrorKind::NotFound => {
-            println!("File not found: {kvp_file:?}");
-            return Ok(());
-        }
-        Err(e) => {
-            return Err(anyhow::Error::from(e)
-                .context("Failed to access file metadata"));
-        }
-    }
-
-    Ok(())
-}
-
-/// Retrieves the system's uptime using the `sysinfo` crate, returning the duration
-/// since the system booted. This can be useful for time-based calculations or checks,
-/// such as determining whether data is stale or calculating the approximate boot time.
-fn get_uptime() -> Duration {
-    let mut system = System::new();
-    system.refresh_memory();
-    system.refresh_cpu_usage();
-
-    let uptime_seconds = System::uptime();
-    Duration::from_secs(uptime_seconds)
-}
-
-/// Given a span's metadata, this constructs a span name in the format
-/// `module:function`.
-///
-/// # Examples
-/// - Target: `azure_init`, Name: `provision` -> `provision`
-/// - Target: `libazureinit::provision::user`, Name: `create_user` -> `provision:user:create_user`
 fn format_span_name(metadata: &tracing::Metadata<'_>) -> String {
     let target = metadata.target();
     let name = metadata.name();
-
-    // Strip common crate prefixes
     let module_path = target
         .strip_prefix("libazureinit::")
         .or_else(|| target.strip_prefix("azure_init::"))
         .unwrap_or(target);
 
-    // If there's a module path after stripping, format as module:name
-    // Otherwise just use the name
     if module_path.is_empty() || module_path == target && target == name {
         name.to_string()
     } else {
@@ -605,298 +268,236 @@ fn format_span_name(metadata: &tracing::Metadata<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Telemetry};
-    use crate::error::Error as LibError;
-    use crate::health::encoded_success_report;
-    use tempfile::NamedTempFile;
-    use tokio::time::{sleep, Duration};
-    use tracing::instrument;
-    use tracing::{event, Level};
+    use crate::{error::Error, health::encoded_success_report};
+    use libazureinit_kvp::{
+        Diagnostic, DiagnosticPayload, DiagnosticReader, Entry, KvpPool,
+        PoolMode, PROVISIONING_REPORT_KEY,
+    };
+    use tempfile::TempDir;
     use tracing_subscriber::{layer::SubscriberExt, Registry};
 
-    #[instrument]
-    async fn mock_child_function(index: usize) {
-        event!(
-            Level::INFO,
-            msg = format!("Event in child span for item {}", index)
-        );
-        sleep(Duration::from_millis(200)).await;
-    }
+    const VM_ID: &str = "00000000-0000-0000-0000-000000000abc";
 
-    #[instrument]
-    async fn mock_provision(vm_id: &str) -> Result<(), anyhow::Error> {
-        let mut system = System::new();
-        system.refresh_memory();
-        system.refresh_cpu_usage();
-
-        let kernel_version = System::kernel_version()
-            .unwrap_or("Unknown Kernel Version".to_string());
-        let os_version =
-            System::os_version().unwrap_or("Unknown OS Version".to_string());
-        let azure_init_version = env!("CARGO_PKG_VERSION");
-
-        event!(
-            Level::INFO,
-            msg = format!(
-                "Kernel Version: {}, OS Version: {}, Azure-Init Version: {}",
-                kernel_version, os_version, azure_init_version
-            )
-        );
-
-        event!(Level::INFO, msg = "Provisioning started");
-
-        mock_child_function(0).await;
-        sleep(Duration::from_millis(300)).await;
-
-        let success_report =
-            encoded_success_report(vm_id, Some(("origin", "mock_source")));
-        event!(
-            Level::INFO,
-            health_report = %success_report,
-            "Provisioning completed successfully"
-        );
-
-        Ok(())
-    }
-
-    #[instrument]
-    async fn mock_failure_function(vm_id: &str) -> Result<(), anyhow::Error> {
-        let error_message = "Simulated failure during processing";
-        let err = LibError::UnhandledError {
-            details: error_message.to_string(),
-        };
-        let failure_report = err.as_encoded_report(vm_id);
-
-        event!(
-            Level::ERROR,
-            health_report = %failure_report,
-            "Provisioning failed"
-        );
-
-        sleep(Duration::from_millis(100)).await;
-        Err(anyhow::anyhow!(error_message))
-    }
-
-    #[tokio::test]
-    async fn test_emit_kvp_layer() {
-        let temp_file =
-            NamedTempFile::new().expect("Failed to create tempfile");
-        let temp_path = temp_file.path().to_path_buf();
-
-        let test_vm_id = "00000000-0000-0000-0000-000000000001";
-
-        let graceful_shutdown = CancellationToken::new();
-        let kvp =
-            Kvp::new(temp_path.clone(), test_vm_id, graceful_shutdown.clone())
-                .expect("Failed to create Kvp");
-
-        let subscriber = Registry::default().with(kvp.tracing_layer);
-        let default_guard = tracing::subscriber::set_default(subscriber);
-
-        let _ = mock_provision(test_vm_id).await;
-        let _ = mock_failure_function(test_vm_id).await;
-
-        drop(default_guard);
-        graceful_shutdown.cancel();
-        kvp.writer
-            .await
-            .expect("KVP writer task panicked")
-            .expect("KVP writer task returned an IO error");
-
-        let contents =
-            std::fs::read(temp_path).expect("Failed to read temp file");
-        println!("Contents of the file (in bytes):\n{contents:?}");
-
-        let slice_size =
-            HV_KVP_EXCHANGE_MAX_KEY_SIZE + HV_KVP_EXCHANGE_MAX_VALUE_SIZE;
-
-        let num_slices = contents.len().div_ceil(slice_size);
-        let expected_len = num_slices * slice_size;
-
-        assert_eq!(
-            contents.len(),
-            expected_len,
-            "Encoded buffer length is incorrect. Expected {} but got {}",
-            expected_len,
-            contents.len()
-        );
-
-        let mut found_success = false;
-        let mut found_failure = false;
-
-        for i in 0..num_slices {
-            let start = i * slice_size;
-            let end = start + slice_size;
-            let slice = &contents[start..end];
-
-            println!("Processing slice {i}: start={start}, end={end}");
-            println!("Slice length: {}", slice.len());
-
-            let key_section = &slice[..HV_KVP_EXCHANGE_MAX_KEY_SIZE];
-            let value_section = &slice[HV_KVP_EXCHANGE_MAX_KEY_SIZE..];
-
-            match decode_kvp_item(slice) {
-                Ok((key, value)) => {
-                    println!("Decoded KVP - Key: {key}");
-                    println!("Decoded KVP - Value: {value}\n");
-
-                    // Check for success or failure reports
-                    if key == "PROVISIONING_REPORT"
-                        && value.contains("result=success")
-                    {
-                        found_success = true;
-                    }
-
-                    if key == "PROVISIONING_REPORT"
-                        && value.contains("result=error")
-                    {
-                        found_failure = true;
-                    }
-                }
-                Err(e) => {
-                    panic!("Failed to decode KVP: {e}");
-                }
-            }
-
-            assert!(
-                key_section.iter().any(|&b| b != 0),
-                "Key section in slice {i} should contain non-zero bytes"
-            );
-
-            assert!(
-                value_section.iter().any(|&b| b != 0),
-                "Value section in slice {i} should contain non-zero bytes"
-            );
-        }
-
-        assert!(
-            found_success,
-            "Expected to find a 'result=success' entry but did not."
-        );
-        assert!(
-            found_failure,
-            "Expected to find a 'result=error' entry but did not."
-        );
-    }
-
-    #[tokio::test]
-    async fn test_truncate_guest_pool_file() {
-        let temp_file =
-            NamedTempFile::new().expect("Failed to create tempfile");
-        let temp_path = temp_file.path().to_path_buf();
-
-        std::fs::write(&temp_path, "Some initial data")
-            .expect("Failed to write initial data");
-
-        let result = truncate_guest_pool_file(&temp_path);
-
-        assert!(
-            result.is_ok(),
-            "truncate_guest_pool_file returned an error: {result:?}",
-        );
-
-        if let Ok(contents) = std::fs::read_to_string(&temp_path) {
-            if contents.is_empty() {
-                println!("File was truncated as expected.");
-            } else {
-                println!("File was not truncated (this is expected if file has been truncated since boot).");
-            }
-        } else {
-            panic!("Failed to read the temp file after truncation attempt.");
-        }
+    fn store(dir: &TempDir) -> KvpPoolStore {
+        KvpPoolStore::new_in(KvpPool::Guest, dir.path(), PoolMode::Safe)
+            .unwrap()
     }
 
     #[test]
-    fn test_encode_kvp_item_value_length() {
-        let key = "test_key";
-        let value = "A".repeat(HV_KVP_AZURE_MAX_VALUE_SIZE * 2 + 50);
-
-        let encoded_slices = encode_kvp_item(key, &value);
-
-        assert!(
-            !encoded_slices.is_empty(),
-            "Encoded slices should not be empty"
-        );
-
-        for (i, slice) in encoded_slices.iter().enumerate() {
-            assert_eq!(
-                slice.len(),
-                HV_KVP_EXCHANGE_MAX_KEY_SIZE + HV_KVP_EXCHANGE_MAX_VALUE_SIZE,
-                "Slice {i} length is incorrect",
-            );
-
-            let (decoded_key, decoded_value) =
-                decode_kvp_item(slice).expect("Failed to decode slice");
-
-            println!("Slice {i}: Key: {decoded_key}");
-            println!(
-                "Slice {i}: Value (length {}): {decoded_value}",
-                decoded_value.len()
-            );
-
-            assert_eq!(decoded_key, key, "Key mismatch in slice {i}");
-            assert!(
-                decoded_value.len() <= HV_KVP_AZURE_MAX_VALUE_SIZE,
-                "Value length exceeds limit in slice {i}: {} > {HV_KVP_AZURE_MAX_VALUE_SIZE}",
-                decoded_value.len()
-            );
-        }
-
-        println!("All slices adhere to Azure's max value size limit.");
+    fn initialization_rejects_invalid_identity_and_missing_directory() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        assert!(Kvp::new(store.clone(), "invalid", CancellationToken::new())
+            .is_err());
+        assert!(!store.path().exists());
+        let missing = KvpPoolStore::new_in(
+            KvpPool::Guest,
+            dir.path().join("missing"),
+            PoolMode::Safe,
+        )
+        .unwrap();
+        assert!(Kvp::new(missing, VM_ID, CancellationToken::new()).is_err());
     }
 
     #[tokio::test]
-    async fn test_emit_kvp_layer_disabled() {
-        let temp_file =
-            NamedTempFile::new().expect("Failed to create tempfile");
-        let temp_path = temp_file.path().to_path_buf();
+    async fn spans_and_events_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let shutdown = CancellationToken::new();
+        let kvp = Kvp::new(store.clone(), VM_ID, shutdown.clone()).unwrap();
+        let subscriber = Registry::default().with(kvp.tracing_layer);
+        let payload = "quoted \"text\" | \u{1f600}".repeat(100);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("outside a span");
+            let parent = tracing::info_span!("parent");
+            let _parent = parent.enter();
+            let child = tracing::info_span!("child", item = 7);
+            {
+                let _child = child.enter();
+                tracing::info!(message = %payload);
+                tracing::error!("child failure");
+            }
+            drop(child);
+        });
+        shutdown.cancel();
+        kvp.writer.await.unwrap().unwrap();
 
-        let test_vm_id = "00000000-0000-0000-0000-000000000002";
+        let entries = DiagnosticReader::new(store).entries().unwrap();
+        assert_eq!(entries.len(), 6);
+        let diagnostics: Vec<_> = entries
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::Diagnostic(diagnostic) => diagnostic,
+                other => panic!("unexpected entry: {other:?}"),
+            })
+            .collect();
+        assert!(matches!(&diagnostics[2], Diagnostic::Event(event)
+            if event.payload == DiagnosticPayload::from(format!("message={payload}"))));
+        for (start_index, finish_index) in [(0, 5), (1, 4)] {
+            let Diagnostic::Start(start) = &diagnostics[start_index] else {
+                panic!("missing start");
+            };
+            let Diagnostic::Finish(finish) = &diagnostics[finish_index] else {
+                panic!("missing finish");
+            };
+            assert_eq!(start.key.event_id, finish.key.event_id);
+            assert_eq!(start.key.name, finish.key.name);
+            assert_eq!(start.key.vm_id.as_deref(), Some(VM_ID));
+            assert_eq!(
+                start.key.agent,
+                concat!("azure-init/", env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(start.payload, DiagnosticPayload::from(""));
+            assert_eq!(finish.result, Outcome::Failure);
+        }
+    }
 
-        let telemetry_config = Telemetry {
-            kvp_diagnostics: false,
-            kvp_filter: None,
-        };
+    #[tokio::test]
+    async fn reports_replace_without_losing_quoted_values() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        store.insert("unrelated", "preserved").unwrap();
+        let shutdown = CancellationToken::new();
+        let kvp = Kvp::new(store.clone(), VM_ID, shutdown.clone()).unwrap();
+        let subscriber = Registry::default().with(kvp.tracing_layer);
+        let success = encoded_success_report(VM_ID, None);
+        let failure = Error::LoadSshdConfig {
+            details: "a \"quoted\" | failure".to_owned(),
+        }
+        .as_encoded_report(VM_ID);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(health_report = success.as_str());
+            tracing::error!(health_report = %failure);
+        });
+        shutdown.cancel();
+        kvp.writer.await.unwrap().unwrap();
 
-        let config = Config {
-            telemetry: telemetry_config,
-            ..Default::default()
-        };
-
-        let kvp_enabled = config.telemetry.kvp_diagnostics;
-
-        let graceful_shutdown = CancellationToken::new();
-        let emit_kvp_layer = if kvp_enabled {
-            Some(
-                Kvp::new(
-                    temp_path.clone(),
-                    test_vm_id,
-                    graceful_shutdown.clone(),
-                )
-                .expect("Failed to create Kvp")
-                .tracing_layer,
-            )
-        } else {
-            None
-        };
-
-        let subscriber = Registry::default().with(emit_kvp_layer);
-        let default_guard = tracing::subscriber::set_default(subscriber);
-
-        let _ = mock_provision(test_vm_id).await;
-
-        sleep(Duration::from_secs(1)).await;
-
-        drop(default_guard);
-
-        let contents =
-            std::fs::read(temp_path).expect("Failed to read temp file");
-
-        assert!(
-            contents.is_empty(),
-            "KVP file should be empty because kvp_diagnostics is disabled, but found data: {contents:?}",
+        let records = store.dump().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            store.read("unrelated").unwrap().as_deref(),
+            Some("preserved")
         );
+        let stored = store.read(PROVISIONING_REPORT_KEY).unwrap().unwrap();
+        assert_eq!(stored, failure);
+        assert_eq!(
+            stored.parse::<ProvisioningReport>().unwrap(),
+            failure.parse::<ProvisioningReport>().unwrap()
+        );
+        assert!(DiagnosticReader::new(store)
+            .entries()
+            .unwrap()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Report(_))));
+    }
 
-        println!("KVP file is empty as expected because kvp_diagnostics is disabled.");
+    #[tokio::test]
+    async fn successful_span_and_filtered_events() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let shutdown = CancellationToken::new();
+        let kvp = Kvp::new(store.clone(), VM_ID, shutdown.clone()).unwrap();
+        let subscriber = Registry::default().with(
+            kvp.tracing_layer
+                .with_filter(tracing_subscriber::EnvFilter::new("info")),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!("success").entered();
+            tracing::debug!("filtered");
+        });
+        shutdown.cancel();
+        kvp.writer.await.unwrap().unwrap();
+        let entries = DiagnosticReader::new(store).entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            matches!(&entries[1], Entry::Diagnostic(Diagnostic::Finish(finish))
+            if finish.result == Outcome::Success)
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_does_not_replace_final_report() {
+        use crate::{
+            config::Config,
+            health::report_in_progress,
+            unittest::{get_http_response_payload, serve_requests},
+        };
+        use tracing::instrument::WithSubscriber;
+
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let report = encoded_success_report(VM_ID, None);
+        store.insert(PROVISIONING_REPORT_KEY, &report).unwrap();
+        let shutdown = CancellationToken::new();
+        let kvp = Kvp::new(store.clone(), VM_ID, shutdown.clone()).unwrap();
+        let subscriber = Registry::default().with(kvp.tracing_layer);
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.wireserver.health_endpoint =
+            format!("http://{}", listener.local_addr().unwrap());
+        let server_shutdown = CancellationToken::new();
+        let server = tokio::spawn(serve_requests(
+            listener,
+            get_http_response_payload(&reqwest::StatusCode::CREATED, ""),
+            server_shutdown.clone(),
+        ));
+        report_in_progress(&config, VM_ID)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        server_shutdown.cancel();
+        server.await.unwrap();
+        shutdown.cancel();
+        kvp.writer.await.unwrap().unwrap();
+        assert_eq!(
+            store.read(PROVISIONING_REPORT_KEY).unwrap().as_deref(),
+            Some(report.as_str())
+        );
+        assert!(DiagnosticReader::new(store).entries().unwrap().iter().any(
+            |entry| matches!(entry, Entry::Diagnostic(Diagnostic::Event(event))
+                if matches!(&event.payload, DiagnosticPayload::Text(text)
+                    if text.contains("Provisioning is still in progress")))
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_report_is_not_split_or_partially_written() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let report = encoded_success_report(VM_ID, None);
+        store.insert(PROVISIONING_REPORT_KEY, &report).unwrap();
+        let shutdown = CancellationToken::new();
+        let kvp = Kvp::new(store.clone(), VM_ID, shutdown.clone()).unwrap();
+        let subscriber = Registry::default().with(kvp.tracing_layer);
+        let oversized =
+            encoded_success_report(VM_ID, Some(("details", &"x".repeat(1023))));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(health_report = %oversized);
+        });
+        shutdown.cancel();
+        assert!(kvp.writer.await.unwrap().is_err());
+        assert_eq!(
+            store.dump().unwrap(),
+            vec![(PROVISIONING_REPORT_KEY.into(), report)]
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_drains_and_returns_write_errors() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let shutdown = CancellationToken::new();
+        let kvp = Kvp::new(store.clone(), VM_ID, shutdown.clone()).unwrap();
+        let subscriber = Registry::default().with(kvp.tracing_layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!(target: "invalid|name", "invalid")
+                .entered();
+            tracing::info!("invalid diagnostic");
+            tracing::info!(health_report = %encoded_success_report(VM_ID, None));
+        });
+        shutdown.cancel();
+        assert!(kvp.writer.await.unwrap().is_err());
+        assert!(store.read(PROVISIONING_REPORT_KEY).unwrap().is_some());
     }
 }

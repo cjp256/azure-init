@@ -121,7 +121,7 @@ full details.
 ### Source references
 - `hv_kvp_daemon`: [`kvp_update_file()`](https://github.com/torvalds/linux/blob/master/tools/hv/hv_kvp_daemon.c) (upsert + full rewrite), [`kvp_update_mem_state()`](https://github.com/torvalds/linux/blob/master/tools/hv/hv_kvp_daemon.c) (re-read before every op)
 - cloud-init: [`write_key()`](https://github.com/canonical/cloud-init/blob/main/cloudinit/sources/helpers/azure.py) (append + truncate), [`_break_down()`](https://github.com/canonical/cloud-init/blob/main/cloudinit/sources/helpers/azure.py) (1,016 B diagnostic chunks)
-- azure-init (current): [`encode_kvp_item()`](https://github.com/Azure/azure-init/blob/main/libazureinit/src/kvp.rs) (append + split), [`truncate_guest_pool_file()`](https://github.com/Azure/azure-init/blob/main/libazureinit/src/kvp.rs) (stale-data guard)
+- azure-init: [`DiagnosticWriter`](../libazureinit-kvp/src/diagnostics/writer.rs) (append + split), [`KvpPoolStore::clear_if_stale()`](../libazureinit-kvp/src/store.rs) (stale-data guard), [`write_report()`](../libazureinit-kvp/src/report.rs) (replace provisioning report)
 
 ### Comparison
 
@@ -129,16 +129,16 @@ full details.
 |--------|-----------|---------|-----------|-------------|----------|-------------|-----------------|--------|---------|------------|
 | hv_kvp_daemon | Upsert + full rewrite | `fcntl` | 512 B (field width) | 2,048 B (field width) | N/A | None | Not checked | Yes (shift + rewrite) | Yes (`kvp_update_mem_state`) | 0–3 |
 | cloud-init | Append-only | `flock()` | 512 B (field width) | 1,024 B (1,023 + null-terminator) | Truncates | Truncate if `mtime` < boot | Yes | No | No | Pool 1 only |
-| azure-init (current) | Append-only, batched | `flock()` (via `fs2`) | 512 B (field width) | 1,022 B/chunk | Splits across records | Truncate if `mtime` < boot (no lock) | Zero-padded (implicit) | No | No | Pool 1 only (hardcoded) |
+| azure-init | Append diagnostics / upsert report | `flock()` + `fcntl` via libazureinit-kvp | Error if > 254 B | 1,022 B | Splits diagnostics; rejects oversized reports | Truncate if `mtime` ≤ boot (with lock) | Explicit null-terminator | No | Yes | Pool 1 only |
 | libazureinit-kvp | Append / upsert / replace | `flock()` + `fcntl` | Error if > 254 B | Error if > 1,022 B | Error | Option to truncate if `mtime` < boot (with lock) | Explicit null-terminator | Yes | N/A (direct file I/O) | Any pool (configurable) |
 
 #### flock vs fcntl
 
 On Linux, `flock()` (BSD) and `fcntl` (POSIX) are independent lock
-namespaces — they do not see each other. cloud-init and azure-init
-(current) use `flock()`; `hv_kvp_daemon` uses `fcntl`. This works
-only because the daemon re-reads the entire pool file before every
-operation, so it picks up external writes regardless of lock type.
+namespaces — they do not see each other. cloud-init uses `flock()`;
+`hv_kvp_daemon` uses `fcntl`. azure-init uses both through
+`libazureinit-kvp`, coordinating with either writer. The daemon also
+re-reads the entire pool file before every operation.
 
 ---
 

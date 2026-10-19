@@ -8,7 +8,7 @@ use reqwest::{
 use std::time::Duration;
 use tracing::instrument;
 
-use chrono::Utc;
+use libazureinit_kvp::{ProvisioningReport, ReportPpsType};
 use reqwest::StatusCode;
 use serde_json::json;
 
@@ -54,19 +54,12 @@ pub fn encoded_success_report(
     optional_key_value: Option<(&str, &str)>,
 ) -> String {
     let agent = format!("Azure-Init/{}", env!("CARGO_PKG_VERSION"));
-    let timestamp = Utc::now().to_rfc3339();
-
-    let mut data = vec![
-        "result=success".to_string(),
-        format!("agent={}", agent),
-        "pps_type=None".to_string(),
-        format!("vm_id={}", vm_id),
-        format!("timestamp={}", timestamp),
-    ];
+    let mut report =
+        ProvisioningReport::success(agent, vm_id, ReportPpsType::None);
     if let Some((k, v)) = optional_key_value {
-        data.push(format!("{k}={v}"));
+        report = report.with_extra(k, v);
     }
-    encode_report(&data)
+    report.to_string()
 }
 
 /// Serializes a slice of key-value strings as a single pipe-delimited entry.
@@ -141,11 +134,18 @@ async fn _report(
     );
 
     if let Some(description_str) = &description {
-        tracing::info!(
-            target: "libazureinit::health::report",
-            health_report = %description_str,
-            "Provisioning report: {}", description_str
-        );
+        if matches!(substatus, Some(ProvisioningSubStatus::Provisioning)) {
+            tracing::info!(
+                target: "libazureinit::health::report",
+                "Provisioning report: {}", description_str
+            );
+        } else {
+            tracing::info!(
+                target: "libazureinit::health::report",
+                health_report = %description_str,
+                "Provisioning report: {}", description_str
+            );
+        }
     }
 
     let body = if let Some(sub) = substatus {
